@@ -19,12 +19,18 @@ from ...utils import _LazyModule
 
 _import_structure = {
     "pipeline_deus": ["DeusPipeline"],
+    "pipeline_deus_img2img": ["DeusImg2ImgPipeline"],
+    "pipeline_deus_inpaint": ["DeusInpaintPipeline"],
+    "pipeline_deus_multimodal": ["DeusMultiModalPipeline"],
     "pipeline_output": ["DeusPipelineOutput"],
 }
 
 
 if TYPE_CHECKING:
     from .pipeline_deus import DeusPipeline
+    from .pipeline_deus_img2img import DeusImg2ImgPipeline
+    from .pipeline_deus_inpaint import DeusInpaintPipeline
+    from .pipeline_deus_multimodal import DeusMultiModalPipeline
     from .pipeline_output import DeusPipelineOutput
 else:
     import sys

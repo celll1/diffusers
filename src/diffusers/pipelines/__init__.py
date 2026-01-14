@@ -52,6 +52,13 @@ else:
     _import_structure["dance_diffusion"] = ["DanceDiffusionPipeline"]
     _import_structure["ddim"] = ["DDIMPipeline"]
     _import_structure["ddpm"] = ["DDPMPipeline"]
+    _import_structure["deus"] = [
+        "DeusPipeline",
+        "DeusImg2ImgPipeline",
+        "DeusInpaintPipeline",
+        "DeusMultiModalPipeline",
+        "DeusPipelineOutput",
+    ]
     _import_structure["dit"] = ["DiTPipeline"]
     _import_structure["latent_diffusion"].extend(["LDMSuperResolutionPipeline"])
     _import_structure["pipeline_utils"] = [
@@ -555,6 +562,13 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         from .ddim import DDIMPipeline
         from .ddpm import DDPMPipeline
         from .deprecated import KarrasVePipeline, LDMPipeline, PNDMPipeline, RePaintPipeline, ScoreSdeVePipeline
+        from .deus import (
+            DeusPipeline,
+            DeusImg2ImgPipeline,
+            DeusInpaintPipeline,
+            DeusMultiModalPipeline,
+            DeusPipelineOutput,
+        )
         from .dit import DiTPipeline
         from .latent_diffusion import LDMSuperResolutionPipeline
         from .pipeline_utils import (
