@@ -24,16 +24,18 @@ Key differences from SDXL:
 """
 
 import inspect
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-from transformers import SiglipModel, SiglipProcessor
+from safetensors.torch import load_file
+from transformers import SiglipModel, SiglipProcessor, Siglip2Model, Siglip2TextModel, AutoTokenizer
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...image_processor import PipelineImageInput, VaeImageProcessor
 from ...models import AutoencoderKL
 from ...models.unets.unet_2d_condition_deus import DeusUNet2DConditionModel
-from ...schedulers import KarrasDiffusionSchedulers
+from ...schedulers import KarrasDiffusionSchedulers, EulerDiscreteScheduler
 from ...utils import logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
@@ -127,6 +129,175 @@ class DeusPipeline(DiffusionPipeline):
     model_cpu_offload_seq = "text_encoder->unet->vae"
     _optional_components = []
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
+
+    # Key prefixes for single file loading (DEUS format)
+    UNET_PREFIX = "model.diffusion_model."
+    VAE_PREFIX = "first_stage_model."
+    TEXT_ENCODER_PREFIX = "conditioner.embedders.0.model."
+
+    @classmethod
+    def from_single_file(
+        cls,
+        pretrained_model_link_or_path: str,
+        *,
+        torch_dtype: Optional[torch.dtype] = None,
+        text_encoder_config: Optional[Dict[str, Any]] = None,
+        vae_config: Optional[Dict[str, Any]] = None,
+        unet_config: Optional[Dict[str, Any]] = None,
+        scheduler: Optional[KarrasDiffusionSchedulers] = None,
+        tokenizer_pretrained: Optional[str] = None,
+        **kwargs,
+    ):
+        """
+        Load a DEUS pipeline from a single safetensors file.
+
+        The safetensors file should contain all model components with the following prefixes:
+        - UNet: "model.diffusion_model.*"
+        - VAE: "first_stage_model.*"
+        - Text Encoder: "conditioner.embedders.0.model.*"
+
+        Args:
+            pretrained_model_link_or_path (`str`):
+                Path to the safetensors file containing all model weights.
+            torch_dtype (`torch.dtype`, *optional*):
+                The torch dtype to load the model with.
+            text_encoder_config (`Dict`, *optional*):
+                Configuration for the text encoder. If not provided, defaults are used.
+            vae_config (`Dict`, *optional*):
+                Configuration for the VAE. If not provided, defaults are used.
+            unet_config (`Dict`, *optional*):
+                Configuration for the UNet. If not provided, defaults are used.
+            scheduler (`KarrasDiffusionSchedulers`, *optional*):
+                Scheduler to use. If not provided, EulerDiscreteScheduler is used.
+            tokenizer_pretrained (`str`, *optional*):
+                Path or repo id for the tokenizer. If not provided, uses SigLIP-2 SO400M tokenizer.
+
+        Returns:
+            `DeusPipeline`: The loaded pipeline.
+
+        Example:
+            ```python
+            from diffusers import DeusPipeline
+
+            pipe = DeusPipeline.from_single_file(
+                "path/to/deus_full.safetensors",
+                torch_dtype=torch.float16,
+            )
+            pipe = pipe.to("cuda")
+            ```
+        """
+        # Load checkpoint
+        if pretrained_model_link_or_path.endswith(".safetensors"):
+            checkpoint = load_file(pretrained_model_link_or_path)
+        else:
+            raise ValueError("Only .safetensors files are supported for from_single_file")
+
+        # Split state dict by component
+        unet_state_dict = {}
+        vae_state_dict = {}
+        text_encoder_state_dict = {}
+
+        for key, value in checkpoint.items():
+            if key.startswith(cls.UNET_PREFIX):
+                new_key = key[len(cls.UNET_PREFIX):]
+                unet_state_dict[new_key] = value
+            elif key.startswith(cls.VAE_PREFIX):
+                new_key = key[len(cls.VAE_PREFIX):]
+                vae_state_dict[new_key] = value
+            elif key.startswith(cls.TEXT_ENCODER_PREFIX):
+                new_key = key[len(cls.TEXT_ENCODER_PREFIX):]
+                text_encoder_state_dict[new_key] = value
+
+        logger.info(
+            f"Loaded checkpoint with {len(unet_state_dict)} UNet keys, "
+            f"{len(vae_state_dict)} VAE keys, {len(text_encoder_state_dict)} text encoder keys"
+        )
+
+        # Create UNet
+        if unet_config is None:
+            unet_config = {}
+        unet = DeusUNet2DConditionModel(**unet_config)
+        unet.load_state_dict(unet_state_dict)
+        if torch_dtype is not None:
+            unet = unet.to(torch_dtype)
+        logger.info(f"Loaded UNet with {sum(p.numel() for p in unet.parameters()):,} parameters")
+
+        # Create VAE
+        if vae_config is None:
+            vae_config = {
+                "in_channels": 3,
+                "out_channels": 3,
+                "down_block_types": ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
+                "up_block_types": ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
+                "block_out_channels": (128, 256, 512, 512),
+                "layers_per_block": 2,
+                "latent_channels": 4,
+            }
+        vae = AutoencoderKL(**vae_config)
+        vae.load_state_dict(vae_state_dict)
+        if torch_dtype is not None:
+            vae = vae.to(torch_dtype)
+        logger.info(f"Loaded VAE with {sum(p.numel() for p in vae.parameters()):,} parameters")
+
+        # Create Text Encoder (SigLIP-2)
+        # Infer config from state dict if not provided
+        if text_encoder_config is None:
+            # Try to infer config from weights
+            # Look for position embedding to determine max_position_embeddings
+            pos_emb_key = "text_model.embeddings.position_embedding.weight"
+            if pos_emb_key in text_encoder_state_dict:
+                max_pos_emb = text_encoder_state_dict[pos_emb_key].shape[0]
+                hidden_size = text_encoder_state_dict[pos_emb_key].shape[1]
+            else:
+                max_pos_emb = 512
+                hidden_size = 1152
+
+            from transformers import Siglip2TextConfig
+            text_encoder_config = Siglip2TextConfig(
+                hidden_size=hidden_size,
+                intermediate_size=4304,
+                num_hidden_layers=27,
+                num_attention_heads=16,
+                max_position_embeddings=max_pos_emb,
+                vocab_size=256000,
+                hidden_act="gelu_pytorch_tanh",
+                layer_norm_eps=1e-6,
+            )
+
+        text_encoder = Siglip2TextModel(text_encoder_config)
+        text_encoder.load_state_dict(text_encoder_state_dict)
+        if torch_dtype is not None:
+            text_encoder = text_encoder.to(torch_dtype)
+        logger.info(f"Loaded Text Encoder with {sum(p.numel() for p in text_encoder.parameters()):,} parameters")
+
+        # Load tokenizer
+        if tokenizer_pretrained is None:
+            tokenizer_pretrained = "google/siglip2-so400m-patch16-naflex"
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_pretrained)
+
+        # Create processor (for compatibility)
+        processor = SiglipProcessor.from_pretrained(tokenizer_pretrained)
+
+        # Create scheduler
+        if scheduler is None:
+            scheduler = EulerDiscreteScheduler(
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                num_train_timesteps=1000,
+            )
+
+        # Create pipeline
+        pipe = cls(
+            vae=vae,
+            text_encoder=text_encoder,
+            processor=processor,
+            unet=unet,
+            scheduler=scheduler,
+            **kwargs,
+        )
+
+        return pipe
 
     def __init__(
         self,
@@ -258,19 +429,18 @@ class DeusPipeline(DiffusionPipeline):
         if isinstance(prompt, str):
             prompt = [prompt]
 
-        # Configure tokenization with proper handling of max_position_embeddings
-        # SigLIP-2 uses learned position embeddings, so we MUST respect max_position_embeddings
-        # to avoid index out of bounds errors.
+        # Configure tokenization for variable length support
+        # DEUS supports variable length text inputs without truncation.
+        # The text encoder's max_position_embeddings should be configured
+        # appropriately (e.g., 256 or 512) to support longer prompts.
         #
         # Strategy:
-        # - Always truncate to max_length (from model's max_position_embeddings)
+        # - No truncation (full prompt length preserved)
         # - Use "longest" padding for batches to minimize padding tokens
         # - Use no padding for single prompts (saves computation)
         tokenizer_kwargs = {
             "return_tensors": "pt",
             "padding": "longest" if len(prompt) > 1 else False,
-            "truncation": True,
-            "max_length": self.tokenizer_max_length,
         }
 
         # Process inputs

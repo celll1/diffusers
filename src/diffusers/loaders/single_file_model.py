@@ -191,6 +191,10 @@ SINGLE_FILE_LOADABLE_CLASSES = {
         "checkpoint_mapping_fn": convert_ltx2_audio_vae_to_diffusers,
         "default_subfolder": "audio_vae",
     },
+    "DeusUNet2DConditionModel": {
+        "checkpoint_mapping_fn": lambda checkpoint, **kwargs: checkpoint,
+        "default_subfolder": "unet",
+    },
 }
 
 
