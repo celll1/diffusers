@@ -284,9 +284,10 @@ class DeusPipeline(DiffusionPipeline):
 
             # Get embeddings from text encoder
             with torch.no_grad():
-                outputs = self.text_encoder(**inputs, output_hidden_states=True)
-                # Use penultimate layer (layer 26 for 27-layer model)
-                prompt_embeds = outputs.text_model_output.hidden_states[-2]
+                outputs = self.text_encoder(**inputs)
+                # Use last_hidden_state from text model
+                # Note: SigLIP-2 doesn't return hidden_states even with output_hidden_states=True
+                prompt_embeds = outputs.text_model_output.last_hidden_state
         else:
             # Text-only mode
             # Access tokenizer directly for more control
@@ -302,10 +303,10 @@ class DeusPipeline(DiffusionPipeline):
                 outputs = self.text_encoder.text_model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    output_hidden_states=True,
                 )
-                # Use penultimate layer
-                prompt_embeds = outputs.hidden_states[-2]
+                # Use last_hidden_state (final layer output)
+                # Note: SigLIP-2 doesn't return hidden_states even with output_hidden_states=True
+                prompt_embeds = outputs.last_hidden_state
 
         return prompt_embeds
 
@@ -494,7 +495,7 @@ class DeusPipeline(DiffusionPipeline):
 
         # 3. Encode prompts
         # Note: DEUS uses 2-pass CFG because sequence lengths differ
-        do_classifier_free_guidance = self.do_classifier_free_guidance
+        do_classifier_free_guidance = guidance_scale > 1.0
 
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt=prompt,
