@@ -140,6 +140,97 @@ class DeusMultiModalPipeline(DiffusionPipeline):
     _optional_components = ["image_projection"]
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds", "image_embeds"]
 
+    # Key prefixes for single file loading (DEUS MultiModal format)
+    UNET_PREFIX = "model.diffusion_model."
+    VAE_PREFIX = "first_stage_model."
+    TEXT_ENCODER_PREFIX = "conditioner.embedders.0.model."
+    VISION_ENCODER_PREFIX = "conditioner.embedders.1.model."
+    IMAGE_PROJECTION_PREFIX = "conditioner.embedders.1.projection."
+
+    def save_to_single_file(
+        self,
+        save_path: str,
+        safe_serialization: bool = True,
+    ):
+        """
+        Save the DEUS MultiModal pipeline to a single safetensors file.
+
+        The file will contain all model components with the following prefixes:
+        - UNet: "model.diffusion_model.*"
+        - VAE: "first_stage_model.*"
+        - Text Encoder: "conditioner.embedders.0.model.*"
+        - Vision Encoder: "conditioner.embedders.1.model.*" (from text_encoder.vision_model)
+        - Image Projection: "conditioner.embedders.1.projection.*" (if present)
+
+        Args:
+            save_path (`str`):
+                Path to save the safetensors file. Should end with `.safetensors`.
+            safe_serialization (`bool`, *optional*, defaults to `True`):
+                Whether to use safetensors format. Only safetensors is supported.
+
+        Example:
+            ```python
+            from diffusers import DeusMultiModalPipeline
+
+            pipe = DeusMultiModalPipeline.from_pretrained("path/to/deus-multimodal")
+            pipe.save_to_single_file("deus_multimodal.safetensors")
+            ```
+        """
+        if not safe_serialization:
+            raise ValueError("Only safetensors format is supported for save_to_single_file")
+
+        if not save_path.endswith(".safetensors"):
+            save_path = save_path + ".safetensors"
+
+        from safetensors.torch import save_file
+
+        combined_state_dict = {}
+
+        # Save UNet weights
+        logger.info("Collecting UNet weights...")
+        unet_state = self.unet.state_dict()
+        for key, value in unet_state.items():
+            combined_state_dict[f"{self.UNET_PREFIX}{key}"] = value
+
+        # Save VAE weights
+        logger.info("Collecting VAE weights...")
+        vae_state = self.vae.state_dict()
+        for key, value in vae_state.items():
+            combined_state_dict[f"{self.VAE_PREFIX}{key}"] = value
+
+        # Save Text Encoder weights (text_model part)
+        logger.info("Collecting Text Encoder weights...")
+        if hasattr(self.text_encoder, "text_model"):
+            text_encoder_state = self.text_encoder.text_model.state_dict()
+        else:
+            text_encoder_state = self.text_encoder.state_dict()
+        for key, value in text_encoder_state.items():
+            combined_state_dict[f"{self.TEXT_ENCODER_PREFIX}{key}"] = value
+
+        # Save Vision Encoder weights (vision_model part)
+        logger.info("Collecting Vision Encoder weights...")
+        if hasattr(self.text_encoder, "vision_model"):
+            vision_encoder_state = self.text_encoder.vision_model.state_dict()
+            for key, value in vision_encoder_state.items():
+                combined_state_dict[f"{self.VISION_ENCODER_PREFIX}{key}"] = value
+
+        # Save Image Projection weights (if present)
+        if self.image_projection is not None:
+            logger.info("Collecting Image Projection weights...")
+            projection_state = self.image_projection.state_dict()
+            for key, value in projection_state.items():
+                combined_state_dict[f"{self.IMAGE_PROJECTION_PREFIX}{key}"] = value
+
+        # Save to file
+        logger.info(f"Saving to {save_path}...")
+        save_file(combined_state_dict, save_path)
+
+        total_params = sum(p.numel() for p in combined_state_dict.values())
+        logger.info(
+            f"Saved {len(combined_state_dict)} tensors with {total_params:,} parameters "
+            f"to {save_path}"
+        )
+
     def __init__(
         self,
         vae: AutoencoderKL,

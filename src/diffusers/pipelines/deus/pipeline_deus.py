@@ -299,6 +299,74 @@ class DeusPipeline(DiffusionPipeline):
 
         return pipe
 
+    def save_to_single_file(
+        self,
+        save_path: str,
+        safe_serialization: bool = True,
+    ):
+        """
+        Save the DEUS pipeline to a single safetensors file.
+
+        The file will contain all model components with the following prefixes:
+        - UNet: "model.diffusion_model.*"
+        - VAE: "first_stage_model.*"
+        - Text Encoder: "conditioner.embedders.0.model.*"
+
+        This is the inverse of `from_single_file` and produces a file that can be
+        loaded using `DeusPipeline.from_single_file()`.
+
+        Args:
+            save_path (`str`):
+                Path to save the safetensors file. Should end with `.safetensors`.
+            safe_serialization (`bool`, *optional*, defaults to `True`):
+                Whether to use safetensors format. Only safetensors is supported.
+
+        Example:
+            ```python
+            from diffusers import DeusPipeline
+
+            pipe = DeusPipeline.from_pretrained("path/to/deus-model")
+            pipe.save_to_single_file("deus_model.safetensors")
+            ```
+        """
+        if not safe_serialization:
+            raise ValueError("Only safetensors format is supported for save_to_single_file")
+
+        if not save_path.endswith(".safetensors"):
+            save_path = save_path + ".safetensors"
+
+        from safetensors.torch import save_file
+
+        combined_state_dict = {}
+
+        # Save UNet weights
+        logger.info("Collecting UNet weights...")
+        unet_state = self.unet.state_dict()
+        for key, value in unet_state.items():
+            combined_state_dict[f"{self.UNET_PREFIX}{key}"] = value
+
+        # Save VAE weights
+        logger.info("Collecting VAE weights...")
+        vae_state = self.vae.state_dict()
+        for key, value in vae_state.items():
+            combined_state_dict[f"{self.VAE_PREFIX}{key}"] = value
+
+        # Save Text Encoder weights
+        logger.info("Collecting Text Encoder weights...")
+        text_encoder_state = self.text_encoder.state_dict()
+        for key, value in text_encoder_state.items():
+            combined_state_dict[f"{self.TEXT_ENCODER_PREFIX}{key}"] = value
+
+        # Save to file
+        logger.info(f"Saving to {save_path}...")
+        save_file(combined_state_dict, save_path)
+
+        total_params = sum(p.numel() for p in combined_state_dict.values())
+        logger.info(
+            f"Saved {len(combined_state_dict)} tensors with {total_params:,} parameters "
+            f"to {save_path}"
+        )
+
     def __init__(
         self,
         vae: AutoencoderKL,
