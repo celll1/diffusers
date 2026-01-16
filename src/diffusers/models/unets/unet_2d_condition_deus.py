@@ -258,6 +258,12 @@ class DeusUNet2DConditionModel(
         self.use_rope_2d = use_rope_2d
         self.rope_theta = rope_theta
 
+        # RoPE cache for faster inference
+        # Key: (height, width, attention_head_dim) -> (cos, sin)
+        self._rope_cache: Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._rope_cache_device: Optional[torch.device] = None
+        self._rope_cache_dtype: Optional[torch.dtype] = None
+
         # Convert to lists if needed
         if isinstance(layers_per_block, int):
             layers_per_block = [layers_per_block] * len(down_block_types)
@@ -839,7 +845,10 @@ class DeusUNet2DConditionModel(
         dtype: torch.dtype,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Generate RoPE 2D embeddings for a specific resolution.
+        Generate RoPE 2D embeddings for a specific resolution with caching.
+
+        During inference, the same resolutions are used repeatedly (e.g., 128x128, 64x64, 32x32
+        for different UNet stages). Caching these embeddings avoids redundant computation.
 
         Args:
             height: Height of the feature map.
@@ -854,6 +863,19 @@ class DeusUNet2DConditionModel(
         if not self.use_rope_2d:
             return None
 
+        cache_key = (height, width, attention_head_dim)
+
+        # Check if we need to invalidate cache due to device/dtype change
+        if self._rope_cache_device != device or self._rope_cache_dtype != dtype:
+            self._rope_cache.clear()
+            self._rope_cache_device = device
+            self._rope_cache_dtype = dtype
+
+        # Check cache
+        if cache_key in self._rope_cache:
+            return self._rope_cache[cache_key]
+
+        # Generate new RoPE embeddings
         crops_coords = ((0, 0), (height, width))
         grid_size = (height, width)
 
@@ -866,4 +888,175 @@ class DeusUNet2DConditionModel(
             output_type="pt",
         )
 
-        return (freqs_cos.to(dtype), freqs_sin.to(dtype))
+        result = (freqs_cos.to(dtype), freqs_sin.to(dtype))
+
+        # Cache the result (limit cache size to prevent memory issues)
+        if len(self._rope_cache) < 64:  # Reasonable limit for different resolutions
+            self._rope_cache[cache_key] = result
+
+        return result
+
+    def clear_rope_cache(self):
+        """
+        Clear the RoPE embedding cache.
+
+        Call this when changing image resolution significantly or to free memory.
+        """
+        self._rope_cache.clear()
+
+    def precompute_rope_cache(
+        self,
+        image_size: Union[int, Tuple[int, int]],
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        """
+        Precompute RoPE embeddings for all resolutions used in the UNet.
+
+        This can be called before inference to warm up the cache and avoid
+        computation during the first denoising step.
+
+        Args:
+            image_size: The target image size (height, width) or single int for square.
+            device: Device to create tensors on.
+            dtype: Data type for the tensors.
+
+        Example:
+            ```python
+            # Precompute for 1024x1024 generation
+            unet.precompute_rope_cache(1024, device="cuda", dtype=torch.float16)
+            ```
+        """
+        if not self.use_rope_2d:
+            return
+
+        if isinstance(image_size, int):
+            image_size = (image_size, image_size)
+
+        # Clear existing cache
+        self.clear_rope_cache()
+        self._rope_cache_device = device
+        self._rope_cache_dtype = dtype
+
+        # Calculate latent size (VAE downscales by 8)
+        latent_h = image_size[0] // 8
+        latent_w = image_size[1] // 8
+
+        # Get attention head dims for each stage
+        attention_head_dims = self.config.attention_head_dim
+        if isinstance(attention_head_dims, int):
+            attention_head_dims = [attention_head_dims] * len(self.down_blocks)
+
+        # Precompute for each resolution stage
+        # Down blocks: latent_size -> latent_size/2 -> latent_size/4 ...
+        current_h, current_w = latent_h, latent_w
+
+        for i, attn_head_dim in enumerate(attention_head_dims):
+            self._get_rope_for_resolution(current_h, current_w, attn_head_dim, device, dtype)
+            current_h = current_h // 2
+            current_w = current_w // 2
+
+        # Mid block (smallest resolution)
+        mid_attn_head_dim = attention_head_dims[-1]
+        # current_h, current_w already at smallest after down blocks
+
+        # Up blocks (reverse order, resolutions increase)
+        reversed_dims = list(reversed(attention_head_dims))
+        for i, attn_head_dim in enumerate(reversed_dims):
+            self._get_rope_for_resolution(current_h, current_w, attn_head_dim, device, dtype)
+            if i < len(reversed_dims) - 1:
+                current_h = current_h * 2
+                current_w = current_w * 2
+
+    def compile_model(
+        self,
+        mode: str = "reduce-overhead",
+        fullgraph: bool = False,
+        dynamic: bool = True,
+    ) -> "DeusUNet2DConditionModel":
+        """
+        Compile the UNet model using torch.compile for faster inference.
+
+        This method applies torch.compile with optimal settings for diffusion models.
+        The model operates with variable encoder sequence lengths (7-293 tokens),
+        so dynamic=True is recommended.
+
+        Args:
+            mode: Compilation mode. Options:
+                - "reduce-overhead": Best for inference (default)
+                - "max-autotune": Slower compilation but potentially faster execution
+                - "default": Balanced mode
+            fullgraph: If True, requires the entire model to be capturable as a single graph.
+                      Set to False for compatibility (default).
+            dynamic: If True, allows dynamic tensor shapes. Should be True for DEUS
+                    due to variable sequence lengths (default).
+
+        Returns:
+            The compiled model (self).
+
+        Example:
+            ```python
+            # Compile for fastest inference
+            unet = unet.compile_model(mode="reduce-overhead")
+
+            # Or compile with maximum optimization (slower compile time)
+            unet = unet.compile_model(mode="max-autotune")
+            ```
+
+        Note:
+            - Compilation happens lazily on first forward pass
+            - First few runs may be slower as the compiler traces the graph
+            - Works best with consistent batch sizes
+        """
+        import torch
+
+        if not hasattr(torch, "compile"):
+            logger.warning("torch.compile is not available. Requires PyTorch 2.0+")
+            return self
+
+        # Compile the forward method
+        self.forward = torch.compile(
+            self.forward,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+
+        logger.info(f"DeusUNet2DConditionModel compiled with mode='{mode}', dynamic={dynamic}")
+
+        return self
+
+    def enable_gradient_checkpointing(self, value: bool = True):
+        """
+        Enable gradient checkpointing for memory-efficient training.
+
+        This trades compute for memory by not storing intermediate activations
+        during the forward pass, instead recomputing them during backward.
+
+        Args:
+            value: If True, enable gradient checkpointing. If False, disable it.
+        """
+        def set_gradient_checkpointing(module, value: bool):
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = value
+
+        self.apply(lambda m: set_gradient_checkpointing(m, value))
+
+    @property
+    def attn_processors(self) -> Dict[str, AttentionProcessor]:
+        """
+        Returns a dictionary of attention processors used in this model.
+        """
+        processors = {}
+
+        def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, AttentionProcessor]):
+            if hasattr(module, "processor"):
+                processors[name] = module.processor
+            for sub_name, child in module.named_children():
+                fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
+            return processors
+
+        for name, module in self.named_children():
+            fn_recursive_add_processors(name, module, processors)
+
+        return processors

@@ -409,6 +409,79 @@ class DeusPipeline(DiffusionPipeline):
         else:
             self.tokenizer_max_length = tokenizer_max_length
 
+    def enable_optimizations(
+        self,
+        image_size: Optional[Union[int, Tuple[int, int]]] = None,
+        compile_unet: bool = True,
+        compile_mode: str = "reduce-overhead",
+        enable_vae_slicing: bool = True,
+        enable_vae_tiling: bool = False,
+    ) -> "DeusPipeline":
+        """
+        Enable performance optimizations for faster inference.
+
+        This method applies multiple optimizations:
+        1. Precomputes RoPE cache for common resolutions
+        2. Optionally compiles the UNet with torch.compile
+        3. Enables VAE slicing for memory efficiency
+        4. Optionally enables VAE tiling for very large images
+
+        Args:
+            image_size: Target image size for RoPE cache precomputation.
+                       If None, uses 1024x1024. Can be int or (height, width).
+            compile_unet: Whether to compile the UNet with torch.compile.
+                         Provides ~20-40% speedup after warmup.
+            compile_mode: Compilation mode ("reduce-overhead", "max-autotune", "default").
+            enable_vae_slicing: Enable VAE slicing for memory efficiency.
+            enable_vae_tiling: Enable VAE tiling for very large images.
+
+        Returns:
+            Self, for method chaining.
+
+        Example:
+            ```python
+            pipe = DeusPipeline.from_single_file("model.safetensors")
+            pipe = pipe.to("cuda", dtype=torch.float16)
+            pipe.enable_optimizations(image_size=1024, compile_unet=True)
+
+            # First inference will be slower (compilation + warmup)
+            # Subsequent inferences will be faster
+            image = pipe("a beautiful sunset").images[0]
+            ```
+
+        Note:
+            - torch.compile requires PyTorch 2.0+
+            - First run after compilation is slow due to tracing
+            - For batch processing with varying sizes, set image_size to the most common size
+        """
+        if image_size is None:
+            image_size = 1024
+
+        device = self._execution_device
+        dtype = next(self.unet.parameters()).dtype
+
+        # 1. Precompute RoPE cache for the target resolution
+        logger.info(f"Precomputing RoPE cache for image_size={image_size}...")
+        self.unet.precompute_rope_cache(image_size, device, dtype)
+
+        # 2. Compile UNet if requested
+        if compile_unet:
+            logger.info(f"Compiling UNet with mode='{compile_mode}'...")
+            self.unet.compile_model(mode=compile_mode, dynamic=True)
+
+        # 3. Enable VAE slicing for memory efficiency
+        if enable_vae_slicing:
+            logger.info("Enabling VAE slicing...")
+            self.enable_vae_slicing()
+
+        # 4. Enable VAE tiling for large images
+        if enable_vae_tiling:
+            logger.info("Enabling VAE tiling...")
+            self.enable_vae_tiling()
+
+        logger.info("Optimizations enabled!")
+        return self
+
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],

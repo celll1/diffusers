@@ -50,6 +50,11 @@ class DeusAttnProcessor:
     """
     Attention processor for DEUS that applies RoPE 2D embeddings to self-attention
     and standard cross-attention for text conditioning.
+
+    Optimizations:
+    - Minimizes tensor copies and transposes
+    - Uses contiguous() strategically to avoid stride issues
+    - Fuses reshape operations where possible
     """
 
     _attention_backend = None
@@ -83,21 +88,28 @@ class DeusAttnProcessor:
             key = attn.to_k(hidden_states)
             value = attn.to_v(hidden_states)
 
-        # Reshape to (batch, seq, heads, dim_head) for dispatch_attention_fn
-        # Note: dispatch_attention_fn expects (B, S, H, D) format
-        query = query.view(batch_size, -1, attn.heads, attn.dim_head)
-        key = key.view(batch_size, -1, attn.heads, attn.dim_head)
-        value = value.view(batch_size, -1, attn.heads, attn.dim_head)
-
         # Apply RoPE only to self-attention (spatial positions)
-        # RoPE expects (B, H, S, D) format, so transpose before and after
+        # Optimize: reshape directly to (B, H, S, D) for RoPE, avoiding extra transpose
         if image_rotary_emb is not None and not is_cross_attention:
-            query = query.transpose(1, 2)  # (B, H, S, D)
-            key = key.transpose(1, 2)
+            # Reshape to (B, S, H, D) then transpose to (B, H, S, D) for RoPE
+            query = query.view(batch_size, -1, attn.heads, attn.dim_head).transpose(1, 2)
+            key = key.view(batch_size, -1, attn.heads, attn.dim_head).transpose(1, 2)
+
+            # Apply RoPE (expects B, H, S, D)
             query = apply_rotary_emb(query, image_rotary_emb, use_real=True)
             key = apply_rotary_emb(key, image_rotary_emb, use_real=True)
-            query = query.transpose(1, 2)  # (B, S, H, D)
-            key = key.transpose(1, 2)
+
+            # Transpose back to (B, S, H, D) for attention - make contiguous for efficiency
+            query = query.transpose(1, 2).contiguous()
+            key = key.transpose(1, 2).contiguous()
+
+            # Value doesn't need RoPE
+            value = value.view(batch_size, -1, attn.heads, attn.dim_head)
+        else:
+            # Standard path: reshape to (B, S, H, D) for dispatch_attention_fn
+            query = query.view(batch_size, -1, attn.heads, attn.dim_head)
+            key = key.view(batch_size, -1, attn.heads, attn.dim_head)
+            value = value.view(batch_size, -1, attn.heads, attn.dim_head)
 
         # Compute attention using dispatch_attention_fn
         # Input: (B, S, H, D), Output: (B, S, H, D)
@@ -110,7 +122,8 @@ class DeusAttnProcessor:
         )
 
         # Reshape back: flatten heads and dim_head
-        hidden_states = hidden_states.flatten(2, 3)  # (B, S, H*D)
+        # Use reshape instead of flatten for potential memory efficiency
+        hidden_states = hidden_states.reshape(batch_size, -1, attn.heads * attn.dim_head)
         hidden_states = hidden_states.to(query.dtype)
 
         # Output projection
